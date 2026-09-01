@@ -1,0 +1,26 @@
+services:
+  redis:
+    image: redis:8-alpine
+    container_name: redis-lab
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: redis-lab-postgres
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: redis_lab
+      POSTGRES_PASSWORD: redis_lab
+      POSTGRES_DB: redis_lab
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  postgres_data:
