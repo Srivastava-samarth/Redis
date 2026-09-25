@@ -92,25 +92,37 @@ func (c *URLController) CreateURL(ctx *gin.Context) {
 }
 
 func (c *URLController) GetURL(ctx *gin.Context) {
-	shortCode := ctx.Param("shortCode")
+    shortCode := ctx.Param("shortCode")
 
-	if shortCode == "" {
-		ctx.JSON(http.StatusBadRequest, gin.H{
-			"error": "short code is required",
-		})
-		return
-	}
+    if shortCode == "" {
+        ctx.JSON(http.StatusBadRequest, gin.H{
+            "error": "short code is required",
+        })
+        return
+    }
 
-	url, err := c.service.GetURL(shortCode)
+    clientID := ctx.GetHeader("X-Client-ID")
 
-	if err != nil {
-		ctx.JSON(http.StatusNotFound, gin.H{
-			"error": "URL not found",
-		})
-		return
-	}
+    if clientID == "" {
+        ctx.JSON(http.StatusBadRequest, gin.H{
+            "error": "X-Client-ID header is required",
+        })
+        return
+    }
 
-	ctx.JSON(http.StatusOK, getURLResponse{
-		URL: url.OriginalURL,
-	})
+    url, err := c.service.GetURL(
+        clientID,
+        shortCode,
+    )
+
+    if err != nil {
+        ctx.JSON(http.StatusNotFound, gin.H{
+            "error": "URL not found",
+        })
+        return
+    }
+
+    ctx.JSON(http.StatusOK, getURLResponse{
+        URL: url.OriginalURL,
+    })
 }

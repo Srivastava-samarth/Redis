@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -33,6 +34,67 @@ func NewURLService(
 	}
 }
 
+type URLCache struct {
+	ClientID    string `json:"client_id"`
+	ShortCode   string `json:"short_code"`
+	OriginalURL string `json:"original_url"`
+}
+
+func (s *URLService) GetURL(
+    clientID string,
+    shortCode string,
+) (*model.URL, error) {
+    ctx := context.Background()
+
+    key := fmt.Sprintf("url:%s", shortCode)
+
+    value, err := s.redis.Get(ctx, key).Result()
+
+    // Cache hit
+    if err == nil {
+        var cachedURL URLCache
+
+        if err := json.Unmarshal([]byte(value), &cachedURL); err != nil {
+            return nil, err
+        }
+
+        if cachedURL.ClientID != clientID {
+            return nil, gorm.ErrRecordNotFound
+        }
+
+        return &model.URL{
+            ClientID:    cachedURL.ClientID,
+            ShortCode:   cachedURL.ShortCode,
+            OriginalURL: cachedURL.OriginalURL,
+        }, nil
+    }
+
+    // Cache miss / Redis failure → PostgreSQL
+    if !errors.Is(err, redis.Nil) {
+        fmt.Printf("redis cache error: %v\n", err)
+    }
+
+    url, err := s.repo.GetByShortCode(shortCode)
+
+    if err != nil {
+        return nil, err
+    }
+
+    if url.ClientID != clientID {
+        return nil, gorm.ErrRecordNotFound
+    }
+
+    if err := s.cacheURL(ctx, url); err != nil {
+        fmt.Printf(
+            "failed to cache URL %s: %v\n",
+            url.ShortCode,
+            err,
+        )
+    }
+
+    return url, nil
+}
+
 func (s *URLService) CreateURL(
 	clientID string,
 	originalURL string,
@@ -41,8 +103,8 @@ func (s *URLService) CreateURL(
 	ctx := context.Background()
 
 	if err := s.checkRateLimit(ctx, clientID); err != nil {
-        return nil, err
-    }
+		return nil, err
+	}
 	// 1. Check idempotency.
 	existingURL, err := s.checkIdempotency(
 		ctx,
@@ -78,6 +140,14 @@ func (s *URLService) CreateURL(
 			existingURL.ShortCode,
 		); err != nil {
 			return nil, err
+		}
+
+		if err := s.cacheURL(ctx, existingURL); err != nil {
+			fmt.Printf(
+				"failed to cache URL %s: %v\n",
+				existingURL.ShortCode,
+				err,
+			)
 		}
 
 		return existingURL, nil
@@ -130,12 +200,28 @@ func (s *URLService) CreateURL(
 				return nil, finalizeErr
 			}
 
+			if err := s.cacheURL(ctx, existingURL); err != nil {
+				fmt.Printf(
+					"failed to cache URL %s: %v\n",
+					existingURL.ShortCode,
+					err,
+				)
+			}
+
 			return existingURL, nil
 		}
 
 		s.deleteIdempotencyKey(ctx, clientID, idempotencyKey)
 
 		return nil, err
+	}
+
+	if err := s.cacheURL(ctx, url); err != nil {
+		fmt.Printf(
+			"failed to cache URL %s: %v\n",
+			url.ShortCode,
+			err,
+		)
 	}
 
 	// 7. Finalize idempotency.
@@ -317,7 +403,7 @@ func (s *URLService) checkRateLimit(
 		}
 	}
 
-	if count >  10000{
+	if count > 10000 {
 		return ErrRateLimitExceeded
 	}
 
@@ -332,8 +418,27 @@ func (s *URLService) generateShortCode(
 	return fmt.Sprintf("url%d", id)
 }
 
-func (s *URLService) GetURL(
-	shortCode string,
-) (*model.URL, error) {
-	return s.repo.GetByShortCode(shortCode)
+func (s *URLService) cacheURL(
+	ctx context.Context,
+	url *model.URL,
+) error {
+	key := fmt.Sprintf("url:%s", url.ShortCode)
+
+	cacheData := URLCache{
+		ClientID:    url.ClientID,
+		ShortCode:   url.ShortCode,
+		OriginalURL: url.OriginalURL,
+	}
+
+	data, err := json.Marshal(cacheData)
+	if err != nil {
+		return err
+	}
+
+	return s.redis.Set(
+		ctx,
+		key,
+		data,
+		0,
+	).Err()
 }

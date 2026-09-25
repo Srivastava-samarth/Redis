@@ -4,7 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
-	"time"
+	// "time"
 
 	controller "redis-lab/controllers"
 	"redis-lab/repository"
@@ -48,23 +48,23 @@ func main() {
 
 	log.Println("Connected to PostgreSQL")
 
-	go func() {
-    ticker := time.NewTicker(1 * time.Second)
-    defer ticker.Stop()
+// 	go func() {
+//     ticker := time.NewTicker(1 * time.Second)
+//     defer ticker.Stop()
 
-    for range ticker.C {
-        stats := sqlDB.Stats()
+//     for range ticker.C {
+//         stats := sqlDB.Stats()
 
-        log.Printf(
-            "DB Pool — Open: %d | InUse: %d | Idle: %d | WaitCount: %d | WaitDuration: %v",
-            stats.OpenConnections,
-            stats.InUse,
-            stats.Idle,
-            stats.WaitCount,
-            stats.WaitDuration,
-        )
-    }
-}()
+//         log.Printf(
+//             "DB Pool — Open: %d | InUse: %d | Idle: %d | WaitCount: %d | WaitDuration: %v",
+//             stats.OpenConnections,
+//             stats.InUse,
+//             stats.Idle,
+//             stats.WaitCount,
+//             stats.WaitDuration,
+//         )
+//     }
+// }()
 
 	// Redis
 	redisClient := redis.NewClient(&redis.Options{
