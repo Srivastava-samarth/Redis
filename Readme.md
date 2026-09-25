@@ -1,682 +1,534 @@
-# Redis Lab — Persistence Notes
+# Redis Lab
 
-## 1. What is Redis Persistence?
+A hands-on Redis learning project built around a **Go URL shortener** backed by PostgreSQL and Redis.
 
-Redis is primarily an in-memory database, so data exists in RAM.
+The goal of this project is not to build a production-ready URL shortener. The URL shortener acts as a practical sandbox for understanding Redis concepts that are relevant to backend and fintech systems.
 
-If the Redis process/container crashes, data that exists only in memory can be lost.
+## 🎯 Goals
 
-**Persistence** means Redis writes data to disk so it can recover the dataset after a restart/crash.
+The project focuses on learning Redis through realistic backend scenarios:
 
-Redis provides two major persistence mechanisms:
+* Redis fundamentals
+* Redis persistence
+* Counters
+* Rate limiting
+* Idempotency
+* Concurrency and failure behavior
+* API load testing
 
-* **RDB (Redis Database)**
-* **AOF (Append Only File)**
-
-They can also be used together.
+The approach is experiment-driven: **build → test under realistic conditions → observe behavior → understand the underlying concept.**
 
 ---
 
-# 2. RDB — Redis Database Snapshots
-
-RDB works by periodically taking a **snapshot of the current dataset** and storing it on disk.
-
-Think of it like:
+## 🏗️ Architecture
 
 ```text
-RAM
- ↓
-Snapshot
- ↓
-dump.rdb
+                    ┌──────────────┐
+                    │    Client    │
+                    └──────┬───────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │   Go / Gin   │
+                    │  Controller  │
+                    └──────┬───────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │   Service    │
+                    └──────┬───────┘
+                           │
+                    ┌──────┴───────┐
+                    │              │
+                    ▼              ▼
+             ┌────────────┐ ┌────────────┐
+             │   Redis    │ │ Repository │
+             │            │ │            │
+             │ Rate Limit │ │ PostgreSQL │
+             │ Idempotency│ │            │
+             │ Counters   │ │            │
+             └────────────┘ └────────────┘
 ```
 
-The snapshot represents the state of Redis at a particular point in time.
+### Stack
 
-### RDB configuration
+* **Go**
+* **Gin**
+* **PostgreSQL**
+* **Redis 8**
+* **GORM**
+* **Docker Compose**
 
-We initially saw Redis's default configuration:
+---
+
+## 📁 Project Structure
+
+```text
+redis-lab/
+├── main.go
+├── controller/
+│   └── url.go
+├── service/
+│   └── url.go
+├── repository/
+│   └── url.go
+├── model/
+│   └── url.go
+├── loadtest/
+│   ├── api/
+│   ├── counter/
+│   └── idempotency/
+├── docker-compose.yml
+├── docker/
+│   └── redis/
+│       └── redis.conf
+├── migrations/
+│   ├── 001_create_urls.up.sql
+│   └── 001_create_urls.down.sql
+├── .env
+└── go.mod
+```
+
+---
+
+# Redis Concepts
+
+## 1. Redis Fundamentals
+
+Started with the basic Redis operations:
+
+```text
+SET
+GET
+DEL
+INCR
+TTL
+EXPIRE
+SETNX
+```
+
+The main concept learned here was that Redis operations can be atomic and extremely useful for coordinating application state.
+
+---
+
+## 2. Redis Persistence
+
+Redis primarily operates in memory, but persistence allows data to survive Redis restarts.
+
+Two persistence mechanisms were explored:
+
+### RDB
+
+RDB creates point-in-time snapshots of Redis data.
+
+Example configuration:
 
 ```conf
-save 3600 1
-save 300 100
 save 60 10000
+save 300 100
+save 3600 1
 ```
 
-Meaning:
-
-```text
-60 seconds   → snapshot if 10,000 changes occurred
-300 seconds  → snapshot if 100 changes occurred
-3600 seconds → snapshot if 1 change occurred
-```
-
-The general format is:
+The format is:
 
 ```text
 save <seconds> <number-of-changes>
 ```
 
----
-
-## 3. Manual RDB Snapshot
-
-Redis can manually create a snapshot using:
-
-```redis
-BGSAVE
-```
-
-`BGSAVE` performs the snapshot in the background.
-
-We ran:
-
-```redis
-BGSAVE
-```
-
-and observed:
-
-```text
-rdb_saves:1
-rdb_last_bgsave_status:ok
-rdb_changes_since_last_save:0
-```
-
-This showed that the snapshot was successfully created.
-
-The snapshot was stored as:
-
-```text
-/data/dump.rdb
-```
-
----
-
-# 4. What RDB Can Lose
-
-We tested what happens when a write occurs **after the latest RDB snapshot**.
-
-The experiment was:
+A manual snapshot can also be triggered with:
 
 ```text
 BGSAVE
-   ↓
-Snapshot created
-   ↓
-SET crash:test ...
-   ↓
-docker kill redis-lab
-   ↓
-Redis crashes
-   ↓
-Redis starts again
 ```
 
-After restarting Redis:
+An experiment was performed by:
 
-```redis
-GET crash:test
-```
+1. Creating a key.
+2. Creating an RDB snapshot.
+3. Writing another key.
+4. Abruptly terminating Redis.
+5. Restarting Redis.
 
-returned:
+The key written after the latest snapshot was lost.
 
-```text
-(nil)
-```
+This demonstrated the core RDB trade-off:
 
-### Why?
+> **RDB provides snapshots, not a record of every write.**
 
-Because the key was created **after the snapshot**.
+### AOF
 
-The snapshot didn't contain the new key.
+AOF records write operations so Redis can reconstruct its state.
 
-Therefore:
-
-```text
-Latest RDB snapshot
-        ↓
-   crash happens
-        ↓
-writes after snapshot → potentially LOST
-```
-
-This is one of the most important characteristics of RDB.
-
-### Key takeaway
-
-> **RDB gives you point-in-time snapshots, not a record of every individual write.**
-
-The advantage is that RDB snapshots are compact and generally efficient.
-
-The trade-off is that recent writes can be lost between snapshots.
-
----
-
-# 5. Why `docker kill` Instead of `docker stop`?
-
-For our crash experiments, we used:
-
-```powershell
-docker kill redis-lab
-```
-
-rather than:
-
-```powershell
-docker stop redis-lab
-```
-
-`docker kill` abruptly terminates the container's main process.
-
-This is useful for simulating an unexpected Redis process termination.
-
-A graceful shutdown is not the same experiment as an abrupt crash because Redis gets an opportunity to shut down normally.
-
-So when testing durability, we want:
-
-```text
-WRITE
- ↓
-ABRUPT TERMINATION
- ↓
-RESTART
- ↓
-CHECK WHAT SURVIVED
-```
-
----
-
-# 6. AOF — Append Only File
-
-AOF takes a different approach.
-
-Instead of periodically storing only a snapshot, Redis records write operations in an append-only log.
-
-Conceptually:
-
-```text
-SET name Samarth
-SET age 24
-DEL age
-SET city Delhi
-```
-
-becomes a sequence of commands stored on disk.
-
-When Redis starts again, it can replay those operations to reconstruct the dataset.
-
-Conceptually:
-
-```text
-AOF
- ↓
-Replay commands
- ↓
-Reconstruct Redis dataset
-```
-
----
-
-# 7. Our AOF Configuration
-
-We created a dedicated Redis configuration file:
-
-```conf
-port 6379
-
-appendonly yes
-appendfsync everysec
-
-save 60 10000
-save 300 100
-save 3600 1
-```
-
-The important AOF settings are:
+The project uses:
 
 ```conf
 appendonly yes
-```
-
-This enables AOF persistence.
-
-And:
-
-```conf
 appendfsync everysec
 ```
 
-This tells Redis to periodically flush/fsync the AOF approximately once per second.
+An abrupt Redis restart was performed after writing a key, and the key survived.
+
+This demonstrated the core distinction:
+
+```text
+RDB → Snapshot
+AOF → Write log
+```
+
+`appendfsync everysec` provides better durability than relying only on periodic snapshots, while still allowing a small window of potential data loss.
 
 ---
 
-# 8. Why We Created `redis.conf`
+# 3. Counters
 
-Initially, we were changing Redis configuration at runtime:
+Redis `INCR` was used to implement counters.
 
-```redis
-CONFIG SET appendonly yes
-```
-
-Those changes are runtime configuration changes.
-
-They don't automatically become the permanent configuration used when Redis starts again.
-
-We experienced this problem ourselves:
+For example, URL short codes are generated using:
 
 ```text
-CONFIG SET appendonly yes
-        ↓
-AOF enabled
-        ↓
-Redis restarted
-        ↓
-appendonly reverted to "no"
+INCR url:id
 ```
 
-That caused our earlier AOF experiment to be misleading.
-
-### Solution
-
-We created:
+This is preferable to:
 
 ```text
-docker/
-└── redis/
-    └── redis.conf
+GET counter
+      ↓
+increment in application
+      ↓
+SET counter
 ```
 
-and changed Docker Compose to:
+because concurrent requests could race with the GET → increment → SET approach.
 
-```yaml
-volumes:
-  - redis_data:/data
-  - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
-
-command: redis-server /usr/local/etc/redis/redis.conf
-```
-
-Now Redis starts using our configuration file every time.
+Redis performs the increment atomically.
 
 ---
 
-# 9. Verifying AOF
+# 4. Rate Limiting
 
-After starting Redis with the new configuration:
+A simple fixed-window rate limiter was implemented using Redis.
 
-```redis
-CONFIG GET appendonly
-```
-
-returned:
+Each client gets a counter:
 
 ```text
-appendonly
-yes
+rate-limit:<client_id>
 ```
 
-And:
-
-```redis
-CONFIG GET appendfsync
-```
-
-returned:
+The request flow is:
 
 ```text
-appendfsync
-everysec
+INCR rate-limit:<client_id>
+        ↓
+If count == 1
+        ↓
+Set 60 second TTL
+        ↓
+If count > 5
+        ↓
+Reject request
 ```
 
-So we confirmed that our configuration was actually being loaded.
+The configured limit is:
+
+```text
+5 requests / 60 seconds / client
+```
+
+### Load Test
+
+100 concurrent requests were sent through the actual API.
+
+Result:
+
+```text
+Total requests: 100
+Concurrency:    100
+Successful:       5
+Rate limited:    95
+Errors:           0
+```
+
+This demonstrated that Redis can act as a shared counter for enforcing a request limit.
+
+### Redis Failure
+
+Redis was then abruptly stopped and the same API load test was executed.
+
+Result:
+
+```text
+Successful:     0
+Rate limited:   0
+Errors:       100
+```
+
+The API failed closed because rate limiting depends on Redis.
+
+This also demonstrated an important architectural decision:
+
+> When Redis is unavailable, the application does not bypass the rate limiter and continue processing requests.
 
 ---
 
-# 10. AOF Experiment
+# 5. Idempotency
 
-We created:
+Idempotency was implemented to simulate a common payment-system requirement:
 
-```redis
-SET aof:test "hello-aof"
-```
+> Retrying the same logical request should not create duplicate work or duplicate resources.
 
-Then verified:
-
-```redis
-GET aof:test
-```
-
-which returned:
+Each request uses:
 
 ```text
-"hello-aof"
+idempotency:<client_id>:<idempotency_key>
+```
+
+The key initially stores:
+
+```text
+processing
+```
+
+and after successful processing stores the resulting short code:
+
+```text
+url18
+```
+
+The initial claim uses:
+
+```text
+SET key processing NX EX 60
+```
+
+`NX` ensures that only one concurrent request can initially claim the idempotency key.
+
+### Flow
+
+```text
+Request
+   │
+   ▼
+Check Redis
+   │
+   ├── Completed → return existing result
+   │
+   ├── Processing → check DB for recovery
+   │
+   └── Missing
+          │
+          ▼
+      SET NX
+          │
+          ├── Failed → request already processing
+          │
+          └── Claimed
+                 │
+                 ▼
+              Create URL
+                 │
+                 ▼
+          Save completed result
+```
+
+### Concurrent Test
+
+100 concurrent requests were sent with:
+
+* Same client
+* Same URL
+* Same idempotency key
+
+Result:
+
+```text
+Total requests: 100
+Successful:     100
+Conflicts:        0
+Errors:           0
+```
+
+The database contained only one URL for the client and original URL.
+
+The test was repeated after manually deleting the Redis idempotency key.
+
+Result:
+
+```text
+Successful: 100
+Conflicts:    0
+Errors:       0
+```
+
+The database uniqueness constraint allowed the application to recover safely even when Redis state was missing.
+
+### Important Learning
+
+Idempotency does not necessarily mean that only one request touches the database.
+
+Concurrent requests may still perform reads while another request is processing.
+
+The important property is:
+
+> **The same logical request does not create duplicate resources.**
+
+Redis provides fast coordination, while PostgreSQL provides durable correctness.
+
+---
+
+# 6. API Load Testing
+
+The final experiment tested the **actual HTTP API**, rather than interacting with Redis directly.
+
+The load test used:
+
+```text
+Requests:    1000
+Concurrency: 100
+```
+
+### Baseline Result
+
+```text
+Total requests:    1000
+Concurrency:       100
+Successful:        1000
+Errors:               0
+Total duration:    6.98s
+Requests/sec:     143.35
+Average latency:  672.37ms
+Minimum latency:  15.64ms
+Maximum latency:   3.46s
+```
+
+The test demonstrated that the API could successfully process the complete concurrent workload without application-level errors.
+
+Redis was also inspected during the load test using Redis monitoring and statistics.
+
+The observed Redis operations included:
+
+```text
+GET
+SET NX EX
+INCR
+SET
 ```
 
 Redis reported:
 
 ```text
-aof_enabled:1
-aof_current_size:65
-aof_base_size:0
+rejected_connections: 0
+evicted_keys:         0
 ```
 
-The important point was:
+The experiment therefore provided a practical baseline for the current local setup.
 
-```text
-aof_current_size > 0
-```
-
-meaning the AOF contained data.
+The latency measurements are **environment-specific** and are not intended to represent production performance.
 
 ---
 
-# 11. AOF Crash Recovery Test
+# 🔬 What This Project Demonstrated
 
-We then performed the important experiment:
-
-```text
-SET aof:test "hello-aof"
-        ↓
-AOF records the write
-        ↓
-docker kill redis-lab
-        ↓
-Redis crashes
-        ↓
-docker start redis-lab
-        ↓
-Redis loads/replays persistence data
-        ↓
-GET aof:test
-```
-
-The result was:
-
-```text
-"hello-aof"
-```
-
-### What did we prove?
-
-The write survived an abrupt Redis termination.
-
-So unlike our RDB test, the write did not depend solely on the latest RDB snapshot.
+| Concept                           | Demonstrated |
+| --------------------------------- | ------------ |
+| Redis commands                    | ✅            |
+| Counters                          | ✅            |
+| TTL / expiration                  | ✅            |
+| RDB persistence                   | ✅            |
+| AOF persistence                   | ✅            |
+| Rate limiting                     | ✅            |
+| Redis failure behavior            | ✅            |
+| Idempotency                       | ✅            |
+| Concurrent requests               | ✅            |
+| Database uniqueness as safety net | ✅            |
+| API load testing                  | ✅            |
 
 ---
 
-# 12. RDB vs AOF
+# 🧠 Key Takeaways
 
-The core difference we've learned:
+### Redis is not just a cache
 
-### RDB
+Redis can be used for:
 
-```text
-RAM
- ↓
-Periodic snapshot
- ↓
-dump.rdb
-```
+* Fast counters
+* Rate limiting
+* Request coordination
+* Idempotency state
+* Temporary state with expiration
 
-If Redis crashes:
+### Atomic operations matter
 
-```text
-Load latest snapshot
-```
-
-Therefore:
+Operations such as:
 
 ```text
-writes after snapshot
-        ↓
-potentially LOST
+INCR
+SET NX
 ```
 
-### AOF
+are useful because Redis performs them atomically, reducing race conditions between concurrent application instances.
+
+### Redis and PostgreSQL serve different purposes
+
+In this project:
 
 ```text
-WRITE
- ↓
-AOF log
- ↓
-Redis restarts
- ↓
-Replay AOF
+Redis
+→ fast, temporary coordination/state
+
+PostgreSQL
+→ durable source of truth
 ```
 
-Therefore, writes that have been safely persisted to the AOF can be recovered.
+The combination is more useful than trying to make either system responsible for everything.
+
+### Failure testing is as important as happy-path testing
+
+Stopping Redis during the API load test showed how application behavior changes when a dependency becomes unavailable.
+
+### Load testing should be done against the real system
+
+Testing Redis in isolation would not reveal how:
+
+```text
+HTTP
+ ↓
+Gin
+ ↓
+Service
+ ↓
+Redis
+ ↓
+PostgreSQL
+```
+
+behaves as a complete system.
 
 ---
 
-# 13. `appendfsync everysec`
+# 🚫 Concepts Intentionally Not Implemented
 
-Our current configuration is:
+Not every Redis feature is useful for the current learning objective.
 
-```conf
-appendfsync everysec
-```
+The following were intentionally left out:
 
-This provides a useful balance between performance and durability.
+* Redis caching
+* Sessions
+* Distributed locks
+* Redis queues
 
-Conceptually:
-
-```text
-WRITE
- ↓
-AOF buffer
- ↓
-periodic fsync
- ↓
-disk
-```
-
-There can be a small durability window.
-
-If Redis crashes before a very recent write has been fsynced, that write may potentially be lost.
-
-So:
-
-```text
-everysec
-    ↓
-better performance
-    +
-small potential data-loss window
-```
-
-It is **not equivalent to zero-loss durability**.
+Queues will be explored separately when working with **NATS**, rather than adding another messaging system to this project.
 
 ---
 
-# 14. Current Redis Lab Architecture
+# 🚀 Future Scope
 
-Our project is completely isolated from the existing application.
+Possible extensions if they become relevant:
 
-```text
-redis-lab/
-│
-├── main.go
-├── docker-compose.yml
-├── .env
-├── go.mod
-│
-├── docker/
-│   └── redis/
-│       └── redis.conf
-│
-├── internal/
-│   ├── handler/
-│   ├── service/
-│   └── repository/
-│
-├── migrations/
-└── loadtest/
-```
+* More realistic load profiles
+* Redis metrics and observability
+* Expiration and recovery experiments
+* More detailed latency measurements
+* Comparing Redis behavior under different persistence configurations
 
-Docker:
-
-```text
-RedisLab Redis
-localhost:6380
-       │
-       ▼
-Redis container :6379
-
-RedisLab Postgres
-localhost:5434
-       │
-       ▼
-Postgres container :5432
-```
-
----
-
-# 15. Current Redis Configuration
-
-Our current `redis.conf`:
-
-```conf
-port 6379
-
-appendonly yes
-appendfsync everysec
-
-save 60 10000
-save 300 100
-save 3600 1
-```
-
-Therefore we currently have:
-
-```text
-                Redis
-                  │
-        ┌─────────┴─────────┐
-        │                   │
-       RDB                 AOF
-   snapshots            write log
-        │                   │
-   dump.rdb          appendonly files
-```
-
-Both persistence mechanisms are enabled.
-
----
-
-# 16. Important Commands We Learned
-
-### Check RDB configuration
-
-```redis
-CONFIG GET save
-```
-
-### Check AOF configuration
-
-```redis
-CONFIG GET appendonly
-```
-
-### Check AOF fsync mode
-
-```redis
-CONFIG GET appendfsync
-```
-
-### Check persistence statistics
-
-```redis
-INFO persistence
-```
-
-### Manually create an RDB snapshot
-
-```redis
-BGSAVE
-```
-
-### Check a key
-
-```redis
-GET key
-```
-
-### Abruptly kill Redis
-
-```powershell
-docker kill redis-lab
-```
-
-### Start Redis again
-
-```powershell
-docker start redis-lab
-```
-
----
-
-# 17. The Main Mental Model
-
-The most important thing to remember is:
-
-```text
-RDB = "What did my database look like at this snapshot?"
-
-AOF = "What operations happened that I can replay?"
-```
-
-Or even shorter:
-
-```text
-RDB → Snapshot
-AOF → Log
-```
-
-RDB is generally useful when you want compact snapshots and efficient backups.
-
-AOF is useful when you want a more continuous record of writes and better recovery granularity.
-
-Using both gives you two complementary persistence mechanisms.
-
----
-
-# 18. What We Have NOT Tested Yet
-
-The next persistence experiments will be:
-
-1. `appendfsync everysec` vs `always`
-2. Demonstrate the durability window of `everysec`
-3. Understand Redis 8's multi-part AOF structure
-4. Understand:
-
-   * base RDB
-   * incremental AOF
-   * manifest
-5. AOF rewrite
-6. Why AOF files don't grow forever
-7. RDB + AOF interaction during recovery
-8. Persistence performance under load
-9. Automated crash/recovery tests
-
-After persistence, we'll move into:
-
-```text
-Memory
-   ↓
-Eviction
-   ↓
-Cache avalanche
-   ↓
-Cache stampede
-   ↓
-Rate limiting
-   ↓
-Distributed locks
-   ↓
-Streams
-   ↓
-Load testing
-```
-
-The goal is not just to memorize Redis commands, but to **create failures and observe Redis behavior under controlled experiments**.
+The project will remain focused on **understanding Redis through backend problems**, rather than implementing Redis features for their own sake.
