@@ -1,22 +1,26 @@
 # Redis Lab
 
-A hands-on Redis learning project built around a **Go URL shortener** backed by PostgreSQL and Redis.
+A hands-on Redis learning project built around a simple URL shortener using **Go, PostgreSQL, and Redis**.
 
-The goal of this project is not to build a production-ready URL shortener. The URL shortener acts as a practical sandbox for understanding Redis concepts that are relevant to backend and fintech systems.
+The goal of this project is not to build a production-grade URL shortener, but to understand Redis concepts that are directly relevant to backend and fintech systems such as **rate limiting, idempotency, counters, caching, persistence, concurrency, and failure handling**.
+
+---
 
 ## 🎯 Goals
 
-The project focuses on learning Redis through realistic backend scenarios:
+The project focuses on understanding Redis through practical experiments:
 
-* Redis fundamentals
-* Redis persistence
-* Counters
+* Redis data structures and basic commands
+* Redis persistence using **RDB and AOF**
+* Atomic counters using `INCR`
 * Rate limiting
 * Idempotency
-* Concurrency and failure behavior
+* Caching
+* Redis failure behavior
+* Concurrency and race-condition behavior
 * API load testing
 
-The approach is experiment-driven: **build → test under realistic conditions → observe behavior → understand the underlying concept.**
+The emphasis is on **understanding system behavior through experiments**, rather than simply learning Redis commands.
 
 ---
 
@@ -29,39 +33,501 @@ The approach is experiment-driven: **build → test under realistic conditions �
                            │
                            ▼
                     ┌──────────────┐
-                    │   Go / Gin   │
-                    │  Controller  │
-                    └──────┬───────┘
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │   Service    │
+                    │   Go API     │
                     └──────┬───────┘
                            │
                     ┌──────┴───────┐
-                    │              │
-                    ▼              ▼
-             ┌────────────┐ ┌────────────┐
-             │   Redis    │ │ Repository │
-             │            │ │            │
-             │ Rate Limit │ │ PostgreSQL │
-             │ Idempotency│ │            │
-             │ Counters   │ │            │
-             └────────────┘ └────────────┘
+                    │    Service   │
+                    └──┬─────────┬─┘
+                       │         │
+                       ▼         ▼
+                 ┌─────────┐  ┌────────────┐
+                 │  Redis  │  │ PostgreSQL │
+                 └─────────┘  └────────────┘
 ```
 
-### Stack
+Redis is used for:
 
-* **Go**
-* **Gin**
-* **PostgreSQL**
-* **Redis 8**
-* **GORM**
-* **Docker Compose**
+* Counters
+* Rate limiting
+* Idempotency state
+* URL caching
+
+PostgreSQL remains the **source of truth for URL data**.
 
 ---
 
-## 📁 Project Structure
+## 🛠️ Tech Stack
+
+* Go
+* Gin
+* GORM
+* PostgreSQL
+* Redis
+* Docker
+* PowerShell
+* Custom Go load-testing programs
+
+---
+
+# Redis Persistence
+
+Redis primarily stores data in memory, but persistence allows data to survive Redis restarts.
+
+This project experimented with both:
+
+### RDB
+
+RDB periodically creates snapshots of Redis data.
+
+Current configuration:
+
+```conf
+save 60 10000
+save 300 100
+save 3600 1
+```
+
+This means Redis creates a snapshot when the configured number of changes occurs within the configured time window.
+
+Manual snapshots were also tested using:
+
+```redis
+BGSAVE
+```
+
+A crash experiment demonstrated that writes made **after the latest snapshot** can be lost.
+
+### AOF
+
+AOF records write operations so Redis can reconstruct its state after a restart.
+
+Configuration:
+
+```conf
+appendonly yes
+appendfsync everysec
+```
+
+An abrupt Redis termination was tested using:
+
+```bash
+docker kill redis-lab
+```
+
+A key written before the crash was recovered after restarting Redis.
+
+### Key takeaway
+
+```text
+RDB → Snapshot
+AOF → Write log
+```
+
+Both approaches have different durability and performance characteristics.
+
+---
+
+# Atomic Counters
+
+Redis `INCR` was used to create atomic counters.
+
+Example:
+
+```redis
+INCR url:id
+```
+
+The URL shortener uses this to generate sequential short codes:
+
+```text
+url1
+url2
+url3
+...
+```
+
+The important concept here is that `INCR` is atomic.
+
+A naive implementation such as:
+
+```text
+GET
+ ↓
+increment in application
+ ↓
+SET
+```
+
+can produce race conditions when multiple requests execute concurrently.
+
+Redis handles the increment atomically.
+
+---
+
+# Rate Limiting
+
+A simple fixed-window rate limiter was implemented using:
+
+```text
+rate-limit:<client_id>
+```
+
+The counter is incremented using:
+
+```redis
+INCR rate-limit:<client_id>
+```
+
+The first request sets a 60-second expiration:
+
+```redis
+EXPIRE rate-limit:<client_id> 60
+```
+
+The current experiment uses a low limit during normal testing.
+
+### Load test
+
+A concurrent test was executed with:
+
+```text
+100 requests
+100 concurrent workers
+same client
+```
+
+With a limit of 5 requests per minute:
+
+```text
+Successful:      5
+Rate limited:   95
+Errors:          0
+```
+
+Redis failure was also tested.
+
+When Redis was unavailable:
+
+```text
+Successful: 0
+Errors:     100
+```
+
+The rate limiter therefore currently follows a **fail-closed** strategy.
+
+---
+
+# Idempotency
+
+Idempotency was implemented to prevent multiple concurrent requests from creating duplicate URLs.
+
+The Redis key format is:
+
+```text
+idempotency:<client_id>:<idempotency_key>
+```
+
+A request first attempts to claim the key using:
+
+```redis
+SET key processing NX EX 60
+```
+
+Only one concurrent request can successfully claim the key.
+
+The flow is:
+
+```text
+Request
+   │
+   ▼
+Check idempotency key
+   │
+   ├── Completed → return existing result
+   │
+   ├── Processing → recover/check existing DB record
+   │
+   └── Missing → claim key
+                     │
+                     ▼
+                  Create URL
+                     │
+                     ▼
+              Store completed result
+```
+
+PostgreSQL also enforces:
+
+```sql
+UNIQUE (client_id, original_url)
+```
+
+This provides a durable database-level safety net.
+
+### Concurrent test
+
+Test:
+
+```text
+100 concurrent requests
+same client
+same URL
+same idempotency key
+```
+
+Result:
+
+```text
+Successful: 100
+Conflicts:    0
+Errors:       0
+```
+
+PostgreSQL contained exactly one URL record for the client and original URL.
+
+The Redis idempotency key was then manually deleted and the same test was repeated.
+
+The database still contained only one URL, demonstrating that Redis idempotency state is not the ultimate source of truth.
+
+---
+
+# Caching
+
+URL caching was added to the GET endpoint using a **cache-aside pattern**.
+
+Redis key:
+
+```text
+url:<short_code>
+```
+
+Example:
+
+```text
+url:url1001
+```
+
+The cached value contains:
+
+```json
+{
+  "client_id": "client-1",
+  "short_code": "url1001",
+  "original_url": "https://google.com"
+}
+```
+
+The cache does not currently have a TTL.
+
+## Write Path
+
+When a URL is created:
+
+```text
+POST /urls
+      │
+      ├──────────────► PostgreSQL
+      │
+      └──────────────► Redis cache
+```
+
+PostgreSQL remains the source of truth.
+
+Redis stores a copy for fast reads.
+
+## Read Path
+
+The GET endpoint follows:
+
+```text
+GET /urls/:shortCode
+          │
+          ▼
+        Redis
+          │
+      ┌───┴────┐
+      │        │
+     HIT      MISS
+      │        │
+      ▼        ▼
+ Validate    PostgreSQL
+ client_id      │
+      │         ▼
+      │      Redis SET
+      │         │
+      └────┬────┘
+           ▼
+        Response
+```
+
+The cached `client_id` is compared against the `X-Client-ID` supplied with the request.
+
+This prevents a cached URL belonging to one client from being returned to another client.
+
+---
+
+## Cache Hit Experiment
+
+A URL was created and verified in Redis:
+
+```redis
+GET url:url1001
+```
+
+Result:
+
+```json
+{
+  "client_id": "client-1",
+  "short_code": "url1001",
+  "original_url": "https://google.com"
+}
+```
+
+The GET endpoint successfully returned:
+
+```text
+https://google.com
+```
+
+The wrong client ID was also tested and correctly rejected.
+
+---
+
+## Cache Miss Experiment
+
+The Redis cache entry was manually deleted:
+
+```redis
+DEL url:url1001
+```
+
+The GET endpoint was called again.
+
+The URL was successfully returned from PostgreSQL.
+
+Redis was then checked again and the cache entry had been recreated.
+
+This demonstrated:
+
+```text
+Cache miss
+    ↓
+PostgreSQL
+    ↓
+Redis repopulation
+    ↓
+Response
+```
+
+---
+
+## Redis Failure Experiment
+
+Redis was abruptly terminated:
+
+```bash
+docker kill redis-lab
+```
+
+The GET endpoint was called while Redis was unavailable.
+
+The request still successfully returned:
+
+```text
+https://google.com
+```
+
+because the service fell back to PostgreSQL.
+
+This demonstrates an important distinction:
+
+```text
+Rate limiting / Idempotency
+        ↓
+Redis is part of correctness
+        ↓
+Redis failure → request failure
+
+
+Caching
+        ↓
+Redis is an optimization
+        ↓
+Redis failure → PostgreSQL fallback
+```
+
+### Key takeaway
+
+> Redis failure should hurt GET performance, not correctness, when Redis is being used only as a cache.
+
+---
+
+# API Load Testing
+
+A custom Go worker-pool based load tester was created instead of using Go test cases.
+
+Example experiment:
+
+```text
+Requests:       1000
+Concurrency:    100
+```
+
+Observed baseline:
+
+```text
+Successful:     1000
+Errors:            0
+Throughput:     ~143 req/s
+Average latency: ~672 ms
+```
+
+These numbers are environment-specific and are used primarily to understand how the API behaves under concurrent load rather than as a performance benchmark.
+
+Redis was monitored during load testing to observe:
+
+* `GET`
+* `SET`
+* `SETNX`
+* `INCR`
+* Connection behavior
+* Evictions
+* Rejected connections
+
+No Redis evictions or rejected connections were observed during the experiment.
+
+---
+
+# Failure Testing
+
+A major goal of the project is to deliberately break dependencies and observe system behavior.
+
+Experiments include:
+
+* Redis abrupt termination
+* Redis restart
+* RDB recovery
+* AOF recovery
+* Rate limiter failure
+* Idempotency recovery
+* Cache miss
+* Cache repopulation
+* Cache failure with PostgreSQL fallback
+* Concurrent requests
+
+The goal is not simply:
+
+> "Does the API work?"
+
+but:
+
+> **"What happens when part of the system fails?"**
+
+---
+
+# Project Structure
 
 ```text
 redis-lab/
@@ -72,12 +538,9 @@ redis-lab/
 │   └── url.go
 ├── repository/
 │   └── url.go
-├── model/
-│   └── url.go
-├── loadtest/
-│   ├── api/
-│   ├── counter/
-│   └── idempotency/
+├── database/
+│   └── models/
+│       └── url.go
 ├── docker-compose.yml
 ├── docker/
 │   └── redis/
@@ -85,450 +548,103 @@ redis-lab/
 ├── migrations/
 │   ├── 001_create_urls.up.sql
 │   └── 001_create_urls.down.sql
+├── loadtest/
+│   ├── api/
+│   ├── counter/
+│   └── idempotency/
 ├── .env
 └── go.mod
 ```
 
 ---
 
-# Redis Concepts
+# What This Project Taught Me
 
-## 1. Redis Fundamentals
-
-Started with the basic Redis operations:
-
-```text
-SET
-GET
-DEL
-INCR
-TTL
-EXPIRE
-SETNX
-```
-
-The main concept learned here was that Redis operations can be atomic and extremely useful for coordinating application state.
-
----
-
-## 2. Redis Persistence
-
-Redis primarily operates in memory, but persistence allows data to survive Redis restarts.
-
-Two persistence mechanisms were explored:
-
-### RDB
-
-RDB creates point-in-time snapshots of Redis data.
-
-Example configuration:
-
-```conf
-save 60 10000
-save 300 100
-save 3600 1
-```
-
-The format is:
-
-```text
-save <seconds> <number-of-changes>
-```
-
-A manual snapshot can also be triggered with:
-
-```text
-BGSAVE
-```
-
-An experiment was performed by:
-
-1. Creating a key.
-2. Creating an RDB snapshot.
-3. Writing another key.
-4. Abruptly terminating Redis.
-5. Restarting Redis.
-
-The key written after the latest snapshot was lost.
-
-This demonstrated the core RDB trade-off:
-
-> **RDB provides snapshots, not a record of every write.**
-
-### AOF
-
-AOF records write operations so Redis can reconstruct its state.
-
-The project uses:
-
-```conf
-appendonly yes
-appendfsync everysec
-```
-
-An abrupt Redis restart was performed after writing a key, and the key survived.
-
-This demonstrated the core distinction:
-
-```text
-RDB → Snapshot
-AOF → Write log
-```
-
-`appendfsync everysec` provides better durability than relying only on periodic snapshots, while still allowing a small window of potential data loss.
-
----
-
-# 3. Counters
-
-Redis `INCR` was used to implement counters.
-
-For example, URL short codes are generated using:
-
-```text
-INCR url:id
-```
-
-This is preferable to:
-
-```text
-GET counter
-      ↓
-increment in application
-      ↓
-SET counter
-```
-
-because concurrent requests could race with the GET → increment → SET approach.
-
-Redis performs the increment atomically.
-
----
-
-# 4. Rate Limiting
-
-A simple fixed-window rate limiter was implemented using Redis.
-
-Each client gets a counter:
-
-```text
-rate-limit:<client_id>
-```
-
-The request flow is:
-
-```text
-INCR rate-limit:<client_id>
-        ↓
-If count == 1
-        ↓
-Set 60 second TTL
-        ↓
-If count > 5
-        ↓
-Reject request
-```
-
-The configured limit is:
-
-```text
-5 requests / 60 seconds / client
-```
-
-### Load Test
-
-100 concurrent requests were sent through the actual API.
-
-Result:
-
-```text
-Total requests: 100
-Concurrency:    100
-Successful:       5
-Rate limited:    95
-Errors:           0
-```
-
-This demonstrated that Redis can act as a shared counter for enforcing a request limit.
-
-### Redis Failure
-
-Redis was then abruptly stopped and the same API load test was executed.
-
-Result:
-
-```text
-Successful:     0
-Rate limited:   0
-Errors:       100
-```
-
-The API failed closed because rate limiting depends on Redis.
-
-This also demonstrated an important architectural decision:
-
-> When Redis is unavailable, the application does not bypass the rate limiter and continue processing requests.
-
----
-
-# 5. Idempotency
-
-Idempotency was implemented to simulate a common payment-system requirement:
-
-> Retrying the same logical request should not create duplicate work or duplicate resources.
-
-Each request uses:
-
-```text
-idempotency:<client_id>:<idempotency_key>
-```
-
-The key initially stores:
-
-```text
-processing
-```
-
-and after successful processing stores the resulting short code:
-
-```text
-url18
-```
-
-The initial claim uses:
-
-```text
-SET key processing NX EX 60
-```
-
-`NX` ensures that only one concurrent request can initially claim the idempotency key.
-
-### Flow
-
-```text
-Request
-   │
-   ▼
-Check Redis
-   │
-   ├── Completed → return existing result
-   │
-   ├── Processing → check DB for recovery
-   │
-   └── Missing
-          │
-          ▼
-      SET NX
-          │
-          ├── Failed → request already processing
-          │
-          └── Claimed
-                 │
-                 ▼
-              Create URL
-                 │
-                 ▼
-          Save completed result
-```
-
-### Concurrent Test
-
-100 concurrent requests were sent with:
-
-* Same client
-* Same URL
-* Same idempotency key
-
-Result:
-
-```text
-Total requests: 100
-Successful:     100
-Conflicts:        0
-Errors:           0
-```
-
-The database contained only one URL for the client and original URL.
-
-The test was repeated after manually deleting the Redis idempotency key.
-
-Result:
-
-```text
-Successful: 100
-Conflicts:    0
-Errors:       0
-```
-
-The database uniqueness constraint allowed the application to recover safely even when Redis state was missing.
-
-### Important Learning
-
-Idempotency does not necessarily mean that only one request touches the database.
-
-Concurrent requests may still perform reads while another request is processing.
-
-The important property is:
-
-> **The same logical request does not create duplicate resources.**
-
-Redis provides fast coordination, while PostgreSQL provides durable correctness.
-
----
-
-# 6. API Load Testing
-
-The final experiment tested the **actual HTTP API**, rather than interacting with Redis directly.
-
-The load test used:
-
-```text
-Requests:    1000
-Concurrency: 100
-```
-
-### Baseline Result
-
-```text
-Total requests:    1000
-Concurrency:       100
-Successful:        1000
-Errors:               0
-Total duration:    6.98s
-Requests/sec:     143.35
-Average latency:  672.37ms
-Minimum latency:  15.64ms
-Maximum latency:   3.46s
-```
-
-The test demonstrated that the API could successfully process the complete concurrent workload without application-level errors.
-
-Redis was also inspected during the load test using Redis monitoring and statistics.
-
-The observed Redis operations included:
-
-```text
-GET
-SET NX EX
-INCR
-SET
-```
-
-Redis reported:
-
-```text
-rejected_connections: 0
-evicted_keys:         0
-```
-
-The experiment therefore provided a practical baseline for the current local setup.
-
-The latency measurements are **environment-specific** and are not intended to represent production performance.
-
----
-
-# 🔬 What This Project Demonstrated
-
-| Concept                           | Demonstrated |
-| --------------------------------- | ------------ |
-| Redis commands                    | ✅            |
-| Counters                          | ✅            |
-| TTL / expiration                  | ✅            |
-| RDB persistence                   | ✅            |
-| AOF persistence                   | ✅            |
-| Rate limiting                     | ✅            |
-| Redis failure behavior            | ✅            |
-| Idempotency                       | ✅            |
-| Concurrent requests               | ✅            |
-| Database uniqueness as safety net | ✅            |
-| API load testing                  | ✅            |
-
----
-
-# 🧠 Key Takeaways
-
-### Redis is not just a cache
+### 1. Redis is not just a cache
 
 Redis can be used for:
 
-* Fast counters
+* Atomic counters
 * Rate limiting
-* Request coordination
-* Idempotency state
-* Temporary state with expiration
+* Idempotency
+* Caching
+* Temporary state
 
-### Atomic operations matter
+### 2. Atomic operations matter
 
 Operations such as:
 
-```text
+```redis
 INCR
 SET NX
 ```
 
-are useful because Redis performs them atomically, reducing race conditions between concurrent application instances.
+allow Redis to perform operations atomically without requiring application-level locking.
 
-### Redis and PostgreSQL serve different purposes
+### 3. Redis and PostgreSQL have different responsibilities
 
-In this project:
-
-```text
-Redis
-→ fast, temporary coordination/state
-
-PostgreSQL
-→ durable source of truth
-```
-
-The combination is more useful than trying to make either system responsible for everything.
-
-### Failure testing is as important as happy-path testing
-
-Stopping Redis during the API load test showed how application behavior changes when a dependency becomes unavailable.
-
-### Load testing should be done against the real system
-
-Testing Redis in isolation would not reveal how:
+A useful mental model from this project is:
 
 ```text
-HTTP
- ↓
-Gin
- ↓
-Service
- ↓
-Redis
- ↓
 PostgreSQL
+    ↓
+Source of truth
+
+Redis
+    ↓
+Fast state / coordination / optimization
 ```
 
-behaves as a complete system.
+The exact failure behavior depends on what Redis is being used for.
+
+### 4. Failure behavior is part of system design
+
+Testing the happy path is not enough.
+
+Understanding:
+
+```text
+What happens when Redis dies?
+What happens when cache data disappears?
+What happens when concurrent requests arrive?
+What happens when idempotency state is lost?
+```
+
+is an important part of backend engineering.
+
+### 5. Load testing should test behavior, not just numbers
+
+The purpose of the load tests was primarily to understand how the system behaves under concurrency and dependency failures rather than to optimize a particular benchmark number.
 
 ---
 
-# 🚫 Concepts Intentionally Not Implemented
+# Concepts Intentionally Not Implemented
 
-Not every Redis feature is useful for the current learning objective.
+The project deliberately avoids adding Redis features that are not currently relevant to the learning goals.
 
-The following were intentionally left out:
+Not currently implemented:
 
-* Redis caching
-* Sessions
+* Redis Streams
+* Redis Pub/Sub
 * Distributed locks
-* Redis queues
+* Redis sessions
+* Redis Cluster
+* Redis Sentinel
 
-Queues will be explored separately when working with **NATS**, rather than adding another messaging system to this project.
+Queues and messaging will be explored separately through **NATS** rather than turning this project into a collection of unrelated Redis features.
 
 ---
 
-# 🚀 Future Scope
+# Next Steps
 
-Possible extensions if they become relevant:
+The Redis-specific learning objectives are now largely complete.
 
-* More realistic load profiles
-* Redis metrics and observability
-* Expiration and recovery experiments
-* More detailed latency measurements
-* Comparing Redis behavior under different persistence configurations
+Potential future work:
 
-The project will remain focused on **understanding Redis through backend problems**, rather than implementing Redis features for their own sake.
+* Improve observability
+* Add metrics
+* Improve error classification
+* Explore Redis memory behavior
+* Document experiments and findings
+
+The main purpose of Redis Lab is to understand the concepts well enough to apply them to larger backend systems such as **SamPay**.
